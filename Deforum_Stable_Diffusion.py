@@ -3,10 +3,10 @@
 # !!   "id": "c442uQJ_gUgy"
 # !! }}
 """
-# **Deforum Stable Diffusion**
-[Stable Diffusion](https://github.com/CompVis/stable-diffusion) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer and the [Stability.ai](https://stability.ai/) Team
+# **Deforum Stable Diffusion v0.1**
+[Stable Diffusion](https://github.com/CompVis/stable-diffusion) by Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, Björn Ommer and the [Stability.ai](https://stability.ai/) Team. [K Diffusion](https://github.com/crowsonkb/k-diffusion) by [Katherine Crowson](https://twitter.com/RiversHaveWings). You need to get the ckpt file and put it on your Google Drive first to use this. It can be downloaded from [HuggingFace](https://huggingface.co/CompVis/stable-diffusion).
 
-Notebook by [deforum](https://twitter.com/deforum_art)
+Notebook by [deforum](https://discord.gg/upmXXsrwZc)
 """
 
 # %%
@@ -18,6 +18,42 @@ Notebook by [deforum](https://twitter.com/deforum_art)
 import subprocess
 sub_p_res = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total,memory.free', '--format=csv,noheader'], stdout=subprocess.PIPE).stdout.decode('utf-8')
 print(sub_p_res)
+
+# %%
+# !! {"metadata":{
+# !!   "cellView": "form",
+# !!   "id": "TxIOPT0G5Lx1"
+# !! }}
+#@markdown **Model Path Variables**
+# ask for the link
+print("Local Path Variables:\n")
+
+models_path = "/content/models" #@param {type:"string"}
+output_path = "/content/output" #@param {type:"string"}
+
+#@markdown **Google Drive Path Variables (Optional)**
+mount_google_drive = True #@param {type:"boolean"}
+force_remount = False
+
+if mount_google_drive:
+    from google.colab import drive
+    try:
+        drive_path = "/content/drive"
+        drive.mount(drive_path,force_remount=force_remount)
+        models_path_gdrive = "/content/drive/MyDrive/AI/models" #@param {type:"string"}
+        output_path_gdrive = "/content/drive/MyDrive/AI/StableDiffusion" #@param {type:"string"}
+        models_path = models_path_gdrive
+        output_path = output_path_gdrive
+    except:
+        print("...error mounting drive or with drive path variables")
+        print("...reverting to default path variables")
+
+import os
+os.makedirs(models_path, exist_ok=True)
+os.makedirs(output_path, exist_ok=True)
+
+print(f"models_path: {models_path}")
+print(f"output_path: {output_path}")
 
 # %%
 # !! {"metadata":{
@@ -37,74 +73,61 @@ if setup_environment:
                    ['git', 'clone', 'https://github.com/deforum/stable-diffusion'],
                    ['pip', 'install', '-e', 'git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers'],
                    ['pip', 'install', '-e', 'git+https://github.com/openai/CLIP.git@main#egg=clip'],
-                   ['pip', 'install', 'git+https://github.com/deforum/k-diffusion/']
+                   ['pip', 'install', 'accelerate', 'ftfy', 'jsonmerge', 'resize-right', 'torchdiffeq'],
                  ]
     for process in all_process:
-      running = subprocess.run(process,stdout=subprocess.PIPE).stdout.decode('utf-8')
-      if print_subprocess:
-        print(running)
-    print("Runtime > Restart Runtime")
-    print("vv then continue below vv")
+        running = subprocess.run(process,stdout=subprocess.PIPE).stdout.decode('utf-8')
+        if print_subprocess:
+            print(running)
+    
+    print(subprocess.run(['git', 'clone', 'https://github.com/deforum/k-diffusion/'], stdout=subprocess.PIPE).stdout.decode('utf-8'))
+    with open('k-diffusion/k_diffusion/__init__.py', 'w') as f:
+        f.write('')
 
 # %%
 # !! {"metadata":{
-# !!   "cellView": "form",
-# !!   "id": "81qmVZbrm4uu"
+# !!   "id": "81qmVZbrm4uu",
+# !!   "cellView": "form"
 # !! }}
 #@markdown **Python Definitions**
 import json
 from IPython import display
 
-import sys, os
-import argparse, glob
+import argparse, glob, os, pathlib, subprocess, sys, time
+import cv2
+import numpy as np
+import pandas as pd
+import random
+import requests
+import shutil
 import torch
 import torch.nn as nn
-import numpy as np
-import shutil
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from contextlib import contextmanager, nullcontext
+from einops import rearrange, repeat
+from itertools import islice
 from omegaconf import OmegaConf
 from PIL import Image
-from tqdm import tqdm, trange
-from itertools import islice
-from einops import rearrange, repeat
-from torchvision.utils import make_grid
-import time
 from pytorch_lightning import seed_everything
+from skimage.exposure import match_histograms
+from torchvision.utils import make_grid
+from tqdm import tqdm, trange
+from types import SimpleNamespace
 from torch import autocast
-from contextlib import contextmanager, nullcontext
 
+sys.path.append('./src/taming-transformers')
+sys.path.append('./src/clip')
 sys.path.append('./stable-diffusion/')
+sys.path.append('./k-diffusion')
+
 from helpers import save_samples
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
-import k_diffusion as K
-import accelerate
-
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
-
-def get_output_folder(output_path,batch_folder=None):
-    yearMonth = time.strftime('%Y-%m/')
-    out_path = output_path+"/"+yearMonth
-    if batch_folder != "":
-        out_path += batch_folder
-        if out_path[-1] != "/":
-            out_path += "/"
-    os.makedirs(out_path, exist_ok=True)
-    return out_path
-
-def load_img(path):
-    image = Image.open(path).convert("RGB")
-    w, h = image.size
-    print(f"loaded input image of size ({w}, {h}) from {path}")
-    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    image = image.resize((w, h), resample=Image.LANCZOS)
-    image = np.array(image).astype(np.float16) / 255.0
-    image = image[None].transpose(0, 3, 1, 2)
-    image = torch.from_numpy(image)
-    return 2.*image - 1.
+from k_diffusion import sampling
+from k_diffusion.external import CompVisDenoiser
 
 class CFGDenoiser(nn.Module):
     def __init__(self, model):
@@ -117,6 +140,41 @@ class CFGDenoiser(nn.Module):
         cond_in = torch.cat([uncond, cond])
         uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
         return uncond + (cond - uncond) * cond_scale
+
+def add_noise(sample: torch.Tensor, noise_amt: float):
+    return sample + torch.randn(sample.shape, device=sample.device) * noise_amt
+
+def get_output_folder(output_path,batch_folder=None):
+    yearMonth = time.strftime('%Y-%m/')
+    out_path = os.path.join(output_path,yearMonth)
+    if batch_folder != "":
+        out_path = os.path.join(out_path,batch_folder)
+        # we will also make sure the path suffix is a slash if linux and a backslash if windows
+        if out_path[-1] != os.path.sep:
+            out_path += os.path.sep
+    os.makedirs(out_path, exist_ok=True)
+    return out_path
+
+def load_img(path, shape):
+    if path.startswith('http://') or path.startswith('https://'):
+        image = Image.open(requests.get(path, stream=True).raw).convert('RGB')
+    else:
+        image = Image.open(path).convert('RGB')
+
+    image = image.resize(shape, resample=Image.LANCZOS)
+    image = np.array(image).astype(np.float16) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.*image - 1.
+
+def maintain_colors(prev_img, color_match_sample, hsv=False):
+    if hsv:
+        prev_img_hsv = cv2.cvtColor(prev_img, cv2.COLOR_RGB2HSV)
+        color_match_hsv = cv2.cvtColor(color_match_sample, cv2.COLOR_RGB2HSV)
+        matched_hsv = match_histograms(prev_img_hsv, color_match_hsv, multichannel=True)
+        return cv2.cvtColor(matched_hsv, cv2.COLOR_HSV2RGB)
+    else:
+        return match_histograms(prev_img, color_match_sample, multichannel=True)
 
 def make_callback(sampler, dynamic_threshold=None, static_threshold=None):  
     # Creates the callback function to be passed into the samplers
@@ -153,172 +211,131 @@ def make_callback(sampler, dynamic_threshold=None, static_threshold=None):
 
     return callback
 
-def run(args, local_seed):
+def generate(args, return_latent=False, return_sample=False, return_c=False):
+    seed_everything(args.seed)
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # load settings
-    accelerator = accelerate.Accelerator()
-    device = accelerator.device
-    seeds = torch.randint(-2 ** 63, 2 ** 63 - 1, [accelerator.num_processes])
-    torch.manual_seed(seeds[accelerator.process_index].item())
-
-    # plms
-    if args.sampler=="plms":
-        args.eta = 0
+    if args.sampler == 'plms':
         sampler = PLMSSampler(model)
     else:
         sampler = DDIMSampler(model)
 
-    model_wrap = K.external.CompVisDenoiser(model)
-    sigma_min, sigma_max = model_wrap.sigmas[0].item(), model_wrap.sigmas[-1].item()
-
+    model_wrap = CompVisDenoiser(model)       
     batch_size = args.n_samples
-    n_rows = args.n_rows if args.n_rows > 0 else batch_size
+    prompt = args.prompt
+    assert prompt is not None
+    data = [batch_size * [prompt]]
 
-    data = list(chunk(args.prompts, batch_size))
-    sample_index = 0
+    init_latent = None
+    if args.init_latent is not None:
+        init_latent = args.init_latent
+    elif args.init_sample is not None:
+        init_latent = model.get_first_stage_encoding(model.encode_first_stage(args.init_sample))
+    elif args.init_image != None and args.init_image != '':
+        init_image = load_img(args.init_image, shape=(args.W, args.H)).to(device)
+        init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
+        init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space        
+
+    sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.ddim_eta, verbose=False)
+
+    t_enc = int((1.0-args.strength) * args.steps)
 
     start_code = None
-    
-    # init image
-    if args.use_init:
-        assert os.path.isfile(args.init_image)
-        init_image = load_img(args.init_image).to(device)
-        init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
-        init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space
+    if args.fixed_code and init_latent == None:
+        start_code = torch.randn([args.n_samples, args.C, args.H // args.f, args.W // args.f], device=device)
 
-        sampler.make_schedule(ddim_num_steps=args.steps, ddim_eta=args.eta, verbose=False)
+    callback = make_callback(sampler=args.sampler,
+                            dynamic_threshold=args.dynamic_threshold, 
+                            static_threshold=args.static_threshold)
 
-        assert 0. <= args.strength <= 1., 'can only work with strength in [0.0, 1.0]'
-        t_enc = int(args.strength * args.steps)
-        print(f"target t_enc is {t_enc} steps")
-
-    # no init image
-    else:
-        if args.fixed_code:
-            start_code = torch.randn([args.n_samples, args.C, args.H // args.f, args.W // args.f], device=device)
-
-    precision_scope = autocast if args.precision=="autocast" else nullcontext
+    results = []
+    precision_scope = autocast if args.precision == "autocast" else nullcontext
     with torch.no_grad():
         with precision_scope("cuda"):
             with model.ema_scope():
-                tic = time.time()
-                for prompt_index, prompts in enumerate(data):
-                    print(prompts)
-                    prompt_seed = local_seed + prompt_index
-                    seed_everything(prompt_seed)
+                for n in range(args.n_samples):
+                    for prompts in data:
+                        uc = None
+                        if args.scale != 1.0:
+                            uc = model.get_learned_conditioning(batch_size * [""])
+                        if isinstance(prompts, tuple):
+                            prompts = list(prompts)
+                        c = model.get_learned_conditioning(prompts)
 
-                    callback = make_callback(sampler=args.sampler,
-                                            dynamic_threshold=args.dynamic_threshold, 
-                                            static_threshold=args.static_threshold)                            
+                        if args.init_c != None:
+                          c = args.init_c
 
-                    uc = None
-                    if args.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
-
-                    if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
-                        shape = [args.C, args.H // args.f, args.W // args.f]
-                        sigmas = model_wrap.get_sigmas(args.steps)
-                        torch.manual_seed(prompt_seed)
-                        x = torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
-                        model_wrap_cfg = CFGDenoiser(model_wrap)
-                        extra_args = {'cond': c, 'uncond': uc, 'cond_scale': args.scale}
-                        if args.sampler=="klms":
-                            samples = K.sampling.sample_lms(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-                        elif args.sampler=="dpm2":
-                            samples = K.sampling.sample_dpm_2(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-                        elif args.sampler=="dpm2_ancestral":
-                            samples = K.sampling.sample_dpm_2_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-                        elif args.sampler=="heun":
-                            samples = K.sampling.sample_heun(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-                        elif args.sampler=="euler":
-                            samples = K.sampling.sample_euler(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-                        elif args.sampler=="euler_ancestral":
-                            samples = K.sampling.sample_euler_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=not accelerator.is_main_process, callback=callback)
-
-                        x_samples = model.decode_first_stage(samples)
-                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples = accelerator.gather(x_samples)
-
-                    else:
-
-                        # no init image
-                        if not args.use_init:
+                        if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
                             shape = [args.C, args.H // args.f, args.W // args.f]
-
-                            samples, _ = sampler.sample(S=args.steps,
-                                                            conditioning=c,
-                                                            batch_size=args.n_samples,
-                                                            shape=shape,
-                                                            verbose=False,
-                                                            unconditional_guidance_scale=args.scale,
-                                                            unconditional_conditioning=uc,
-                                                            eta=args.eta,
-                                                            x_T=start_code,
-                                                            img_callback=callback)
-
-                        # init image
+                            sigmas = model_wrap.get_sigmas(args.steps)
+                            if args.use_init:
+                                sigmas = sigmas[len(sigmas)-t_enc-1:]
+                                x = init_latent + torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
+                            else:
+                                x = torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
+                            model_wrap_cfg = CFGDenoiser(model_wrap)
+                            extra_args = {'cond': c, 'uncond': uc, 'cond_scale': args.scale}
+                            if args.sampler=="klms":
+                                samples = sampling.sample_lms(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            elif args.sampler=="dpm2":
+                                samples = sampling.sample_dpm_2(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            elif args.sampler=="dpm2_ancestral":
+                                samples = sampling.sample_dpm_2_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            elif args.sampler=="heun":
+                                samples = sampling.sample_heun(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            elif args.sampler=="euler":
+                                samples = sampling.sample_euler(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            elif args.sampler=="euler_ancestral":
+                                samples = sampling.sample_euler_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
                         else:
-                            # encode (scaled latent)
-                            z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
-                            # decode it
-                            samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=args.scale,
-                                                    unconditional_conditioning=uc,)
+
+                            if init_latent != None:
+                                z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                                samples = sampler.decode(z_enc, c, t_enc, unconditional_guidance_scale=args.scale,
+                                                        unconditional_conditioning=uc,)
+                            else:
+                                if args.sampler == 'plms' or args.sampler == 'ddim':
+                                    shape = [args.C, args.H // args.f, args.W // args.f]
+                                    samples, _ = sampler.sample(S=args.steps,
+                                                                    conditioning=c,
+                                                                    batch_size=args.n_samples,
+                                                                    shape=shape,
+                                                                    verbose=False,
+                                                                    unconditional_guidance_scale=args.scale,
+                                                                    unconditional_conditioning=uc,
+                                                                    eta=args.ddim_eta,
+                                                                    x_T=start_code,
+                                                                    img_callback=callback)
+
+                        if return_latent:
+                            results.append(samples.clone())
 
                         x_samples = model.decode_first_stage(samples)
+                        if return_sample:
+                            results.append(x_samples.clone())
+
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-                    
 
-                    grid, images = save_samples(
-                        args, x_samples=x_samples, seed=prompt_seed, n_rows=n_rows
-                    )
-                    if args.display_samples:
-                        for im in images:
-                            display.display(im)
-                    if args.display_grid:
-                        display.display(grid)
+                        if return_c:
+                            results.append(c.clone())
 
-                # stop timer
-                toc = time.time()
+                        for x_sample in x_samples:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            image = Image.fromarray(x_sample.astype(np.uint8))
+                            results.append(image)
+    return results
 
-    #print(f"Your samples are ready and waiting for you here: \n{outpath} \n" f" \nEnjoy.")
+def sample_from_cv2(sample: np.ndarray) -> torch.Tensor:
+    sample = ((sample.astype(float) / 255.0) * 2) - 1
+    sample = sample[None].transpose(0, 3, 1, 2).astype(np.float16)
+    sample = torch.from_numpy(sample)
+    return sample
 
-# %%
-# !! {"metadata":{
-# !!   "cellView": "form",
-# !!   "id": "TxIOPT0G5Lx1"
-# !! }}
-#@markdown **Model Path Variables**
-# ask for the link
-print("Local Path Variables:\n")
-
-models_path = "/content/models" #@param {type:"string"}
-output_path = "/content/output" #@param {type:"string"}
-
-#@markdown **Google Drive Path Variables (Optional)**
-mount_google_drive = True #@param {type:"boolean"}
-force_remount = False
-
-if mount_google_drive:
-    from google.colab import drive
-    try:
-        drive_path = "/content/drive"
-        drive.mount(drive_path,force_remount=force_remount)
-        models_path_gdrive = "/content/drive/MyDrive/AI/models" #@param {type:"string"}
-        output_path_gdrive = "/content/drive/MyDrive/AI/StableDiffusion" #@param {type:"string"}
-        models_path = models_path_gdrive
-        output_path = output_path_gdrive
-    except:
-        print("...error mounting drive or with drive path variables")
-        print("...reverting to default path variables")
-
-os.makedirs(models_path, exist_ok=True)
-os.makedirs(output_path, exist_ok=True)
-
-print(f"models_path: {models_path}")
-print(f"output_path: {output_path}")
+def sample_to_cv2(sample: torch.Tensor) -> np.ndarray:
+    sample_f32 = rearrange(sample.squeeze().cpu().numpy(), "c h w -> h w c").astype(np.float32)
+    sample_f32 = ((sample_f32 * 0.5) + 0.5).clip(0, 1)
+    sample_int8 = (sample_f32 * 255).astype(np.uint8)
+    return sample_int8
 
 # %%
 # !! {"metadata":{
@@ -329,13 +346,14 @@ print(f"output_path: {output_path}")
 print("\nSelect Model:\n")
 
 model_config = "v1-inference.yaml" #@param ["custom","v1-inference.yaml"]
+model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4-full-ema.ckpt","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt"]
 custom_config_path = "" #@param {type:"string"}
-model_checkpoint =  "sd-v1-4.ckpt" #@param ["custom","sd-v1-4.ckpt","sd-v1-3-full-ema.ckpt","sd-v1-3.ckpt","sd-v1-2-full-ema.ckpt","sd-v1-2.ckpt","sd-v1-1-full-ema.ckpt","sd-v1-1.ckpt"]
 custom_checkpoint_path = "" #@param {type:"string"}
 
 check_sha256 = True #@param {type:"boolean"}
 
 model_map = {
+    "sd-v1-4-full-ema.ckpt": {'sha256': '14749efc0ae8ef0329391ad4436feb781b402f4fece4883c7ad8d10556d8a36a'},
     "sd-v1-4.ckpt": {'sha256': 'fe4efff1e174c627256e44ec2991ba279b3816e364b49f9be2abc0b3ff3f8556'},
     "sd-v1-3-full-ema.ckpt": {'sha256': '54632c6e8a36eecae65e36cb0595fab314e1a1545a65209f24fde221a8d4b2ca'},
     "sd-v1-3.ckpt": {'sha256': '2cff93af4dcc07c3e03110205988ff98481e86539c51a8098d4f2236e41f7f2f'},
@@ -366,8 +384,8 @@ else:
 if os.path.exists(models_path+'/'+model_checkpoint):
     print(f"{models_path+'/'+model_checkpoint} exists")
 else:
-    print("...downloading checkpoint")
-    download_model(model_checkpoint)
+    print(f"download model checkpoint and place in {models_path+'/'+model_checkpoint}")
+    #download_model(model_checkpoint)
 
 if check_sha256:
     import hashlib
@@ -401,7 +419,7 @@ print(f"ckpt: {ckpt}")
 # !! }}
 #@markdown **Load Stable Diffusion**
 
-def load_model_from_config(config, ckpt, verbose=False, device='cuda'):
+def load_model_from_config(config, ckpt, verbose=False, device='cuda', half_precision=True):
     map_location = "cuda" #@param ["cpu", "cuda"]
     print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location=map_location)
@@ -418,69 +436,137 @@ def load_model_from_config(config, ckpt, verbose=False, device='cuda'):
         print(u)
 
     #model.cuda()
-    model = model.half().to(device)
+    if half_precision:
+        model = model.half().to(device)
+    else:
+        model = model.to(device)
     model.eval()
     return model
 
-local_config = OmegaConf.load(f"{config}")
-model = load_model_from_config(local_config, f"{ckpt}")
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-model = model.to(device)
+load_on_run_all = True #@param {type: 'boolean'}
+half_precision = True #@param {type: 'boolean'}
+
+if load_on_run_all:
+
+  local_config = OmegaConf.load(f"{config}")
+  model = load_model_from_config(local_config, f"{ckpt}",half_precision=half_precision)
+  device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+  model = model.to(device)
 
 # %%
 # !! {"metadata":{
 # !!   "id": "ov3r4RD1tzsT"
 # !! }}
 """
-# **Run**
+# Settings
+"""
+
+# %%
+# !! {"metadata":{
+# !!   "id": "0j7rgxvLvfay"
+# !! }}
+"""
+### Animation Settings
 """
 
 # %%
 # !! {"metadata":{
 # !!   "cellView": "form",
-# !!   "id": "qH74gBWDd2oq"
+# !!   "id": "8HJN2TE3vh-J"
 # !! }}
-class DeforumArgs():
-    def __init__(self):
 
-        #@markdown **Save & Display Settings**
-        self.batchdir = "test" #@param {type:"string"}
-        self.outdir = get_output_folder(output_path, self.batchdir)
-        self.save_grid = False
-        self.save_samples = True #@param {type:"boolean"}
-        self.save_settings = False #@param {type:"boolean"}
-        self.display_grid = False
-        self.display_samples = True #@param {type:"boolean"}
+def DeforumAnimArgs():
 
-        #@markdown **Image Settings**
-        self.n_samples = 1 #@param
-        self.n_rows = 1 #@param
-        self.W = 512 #@param
-        self.H = 576 #@param
+    #@markdown ####**Animation:**
+    animation_mode = 'None' #@param ['None', '2D', 'Video Input', 'Interpolation'] {type:'string'}
+    max_frames = 1000#@param {type:"number"}
+    border = 'wrap' #@param ['wrap', 'replicate'] {type:'string'}
 
-        #@markdown **Init Settings**
-        self.use_init = False #@param {type:"boolean"}
-        self.init_image = "" #@param {type:"string"}
-        self.strength = 0.1 #@param {type:"number"}
+    #@markdown ####**Motion Parameters:**
+    key_frames = True #@param {type:"boolean"}
+    interp_spline = 'Linear' #Do not change, currently will not look good. param ['Linear','Quadratic','Cubic']{type:"string"}
+    angle = "0:(0)"#@param {type:"string"}
+    zoom = "0: (1.04)"#@param {type:"string"}
+    translation_x = "0: (0)"#@param {type:"string"}
+    translation_y = "0: (0)"#@param {type:"string"}
 
-        #@markdown **Sampling Settings**
-        self.seed = 1 #@param
-        self.sampler = 'klms' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
-        self.steps = 50 #@param
-        self.scale = 7 #@param
-        self.eta = 0.0 #@param
-        self.dynamic_threshold = None #@param
-        self.static_threshold = None #@param    
+    #@markdown ####**Coherence:**
+    color_coherence = 'MatchFrame0' #@param ['None', 'MatchFrame0'] {type:'string'}
+    previous_frame_noise = 0.02#@param {type:"number"}
+    previous_frame_strength = 0.65 #@param {type:"number"}
 
-        #@markdown **Batch Settings**
-        self.n_batch = 2 #@param
+    #@markdown ####**Video Input:**
+    video_init_path ='/content/video_in.mp4'#@param {type:"string"}
+    extract_nth_frame = 1#@param {type:"number"}
 
-        self.precision = 'autocast' 
-        self.fixed_code = True
-        self.C = 4
-        self.f = 8
-        self.prompts = prompts
-        self.timestring = ""
+    #@markdown ####**Interpolation:**
+    interpolate_x_frames = 4 #@param {type:"number"}
+
+    return locals()
+
+anim_args = SimpleNamespace(**DeforumAnimArgs())
+
+def make_xform_2d(width, height, translation_x, translation_y, angle, scale):
+    center = (width // 2, height // 2)
+    trans_mat = np.float32([[1, 0, translation_x], [0, 1, translation_y]])
+    rot_mat = cv2.getRotationMatrix2D(center, angle, scale)
+    trans_mat = np.vstack([trans_mat, [0,0,1]])
+    rot_mat = np.vstack([rot_mat, [0,0,1]])
+    return np.matmul(rot_mat, trans_mat)
+
+def parse_key_frames(string, prompt_parser=None):
+    import re
+    pattern = r'((?P<frame>[0-9]+):[\s]*[\(](?P<param>[\S\s]*?)[\)])'
+    frames = dict()
+    for match_object in re.finditer(pattern, string):
+        frame = int(match_object.groupdict()['frame'])
+        param = match_object.groupdict()['param']
+        if prompt_parser:
+            frames[frame] = prompt_parser(param)
+        else:
+            frames[frame] = param
+    if frames == {} and len(string) != 0:
+        raise RuntimeError('Key Frame string not correctly formatted')
+    return frames
+
+def get_inbetweens(key_frames, integer=False):
+    key_frame_series = pd.Series([np.nan for a in range(anim_args.max_frames)])
+
+    for i, value in key_frames.items():
+        key_frame_series[i] = value
+    key_frame_series = key_frame_series.astype(float)
+    
+    interp_method = anim_args.interp_spline
+    if interp_method == 'Cubic' and len(key_frames.items()) <=3:
+      interp_method = 'Quadratic'    
+    if interp_method == 'Quadratic' and len(key_frames.items()) <= 2:
+      interp_method = 'Linear'
+          
+    key_frame_series[0] = key_frame_series[key_frame_series.first_valid_index()]
+    key_frame_series[anim_args.max_frames-1] = key_frame_series[key_frame_series.last_valid_index()]
+    key_frame_series = key_frame_series.interpolate(method=interp_method.lower(),limit_direction='both')
+    if integer:
+        return key_frame_series.astype(int)
+    return key_frame_series
+
+
+if anim_args.animation_mode == 'None':
+    anim_args.max_frames = 1
+
+if anim_args.key_frames:
+    angle_series = get_inbetweens(parse_key_frames(anim_args.angle))
+    zoom_series = get_inbetweens(parse_key_frames(anim_args.zoom))
+    translation_x_series = get_inbetweens(parse_key_frames(anim_args.translation_x))
+    translation_y_series = get_inbetweens(parse_key_frames(anim_args.translation_y))
+
+# %%
+# !! {"metadata":{
+# !!   "id": "63UOJvU3xdPS"
+# !! }}
+"""
+### Prompts
+`animation_mode: None` batches on list of *prompts*. `animation_mode: 2D` uses *animation_prompts* key frame sequence
+"""
 
 # %%
 # !! {"metadata":{
@@ -492,22 +578,106 @@ prompts = [
     #"the third prompt I don't want it I commented it with an",
 ]
 
+animation_prompts = {
+    0: "a beautiful apple, trending on Artstation",
+    10: "a beautiful banana, trending on Artstation",
+    100: "a beautiful coconut, trending on Artstation",
+    101: "a beautiful durian, trending on Artstation",
+}
+
 # %%
 # !! {"metadata":{
-# !!   "cellView": "form",
-# !!   "id": "cxx8BzxjiaXg"
+# !!   "id": "s8RAo2zI-vQm"
 # !! }}
-#@markdown **Run**
-args = DeforumArgs()
-args.filename = None
-args.prompts = prompts
+"""
+# Run
+"""
 
-def do_batch_run():
-    # create output folder
+# %%
+# !! {"metadata":{
+# !!   "id": "qH74gBWDd2oq",
+# !!   "cellView": "form"
+# !! }}
+def DeforumArgs():
+    #@markdown **Save & Display Settings**
+    batch_name = "StableFun" #@param {type:"string"}
+    outdir = get_output_folder(output_path, batch_name)
+    save_grid = False
+    save_settings = True #@param {type:"boolean"}
+    save_samples = True #@param {type:"boolean"}
+    display_samples = True #@param {type:"boolean"}
+
+    #@markdown **Image Settings**
+    n_samples = 1 #@param
+    W = 512 #@param
+    H = 512 #@param
+    W, H = map(lambda x: x - x % 64, (W, H))  # resize to integer multiple of 64
+
+    #@markdown **Init Settings**
+    use_init = False #@param {type:"boolean"}
+    strength = 0.5 #@param {type:"number"}
+    init_image = "https://cdn.pixabay.com/photo/2022/07/30/13/10/green-longhorn-beetle-7353749_1280.jpg" #@param {type:"string"}
+
+    #@markdown **Sampling Settings**
+    seed = -1 #@param
+    sampler = 'klms' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
+    steps = 10 #@param
+    scale = 7 #@param
+    ddim_eta = 0.0 #@param
+    dynamic_threshold = None
+    static_threshold = None   
+
+    #@markdown **Batch Settings**
+    n_batch = 1 #@param
+    seed_behavior = "iter" #@param ["iter","fixed","random"]
+
+    precision = 'autocast' 
+    fixed_code = True
+    C = 4
+    f = 8
+
+    prompt = ""
+    timestring = ""
+    init_latent = None
+    init_sample = None
+    init_c = None
+
+    return locals()
+
+def next_seed(args):
+    if args.seed_behavior == 'iter':
+        args.seed += 1
+    elif args.seed_behavior == 'fixed':
+        pass # always keep seed the same
+    else:
+        args.seed = random.randint(0, 2**32)
+    return args.seed
+
+
+args = SimpleNamespace(**DeforumArgs())
+args.timestring = time.strftime('%Y%m%d%H%M%S')
+args.strength = max(0.0, min(1.0, args.strength))
+
+if args.seed == -1:
+    args.seed = random.randint(0, 2**32)
+if anim_args.animation_mode == 'Video Input':
+    args.use_init = True
+if not args.use_init:
+    args.init_image = None
+    args.strength = 0
+if args.sampler == 'plms' and (args.use_init or anim_args.animation_mode != 'None'):
+    print(f"Init images aren't supported with PLMS yet, switching to KLMS")
+    args.sampler = 'klms'
+if args.sampler != 'ddim':
+    args.ddim_eta = 0
+
+def render_image_batch(args):
+    args.prompts = prompts
+    
+    # create output folder for the batch
     os.makedirs(args.outdir, exist_ok=True)
-
-    # current timestring for filenames
-    args.timestring = time.strftime('%Y%m%d%H%M%S')
+    if args.save_settings or args.save_samples:
+        print(f"Saving to {os.path.join(args.outdir, args.timestring)}_*")
 
     # save settings for the batch
     if args.save_settings:
@@ -515,27 +685,304 @@ def do_batch_run():
         with open(filename, "w+", encoding="utf-8") as f:
             json.dump(dict(args.__dict__), f, ensure_ascii=False, indent=4)
 
-    for batch_index in range(args.n_batch):
-
-        # random seed
-        if args.seed == -1:
-            local_seed = np.random.randint(0,4294967295)
+    index = 0
+    
+    # function for init image batching
+    init_array = []
+    if args.use_init:
+        if args.init_image == "":
+            raise FileNotFoundError("No path was given for init_image")
+        if not os.path.isfile(args.init_image):
+            if args.init_image[-1] != "/": # avoids path error by adding / to end if not there
+                args.init_image += "/" 
+            for image in sorted(os.listdir(args.init_image)): # iterates dir and appends images to init_array
+                if image.split(".")[-1] in ("png", "jpg", "jpeg"):
+                    init_array.append(args.init_image + image)
         else:
-            local_seed = args.seed
+            init_array.append(args.init_image)
+    else:
+        init_array = [""] 
 
-        print(f"run {batch_index+1} of {args.n_batch}")
-        run(args, local_seed)
+    for batch_index in range(args.n_batch):
+        print(f"Batch {batch_index+1} of {args.n_batch}")
+        
+        for image in init_array: # iterates the init images
+            args.init_image = image
+            for prompt in prompts:
+                args.prompt = prompt
+                results = generate(args)
+                for image in results:
+                    if args.save_samples:
+                        filename = f"{args.timestring}_{index:05}_{args.seed}.png"
+                        image.save(os.path.join(args.outdir, filename))
+                    if args.display_samples:
+                        display.display(image)
+                    index += 1
+                args.seed = next_seed(args)
 
-do_batch_run()
+
+def render_animation(args, anim_args):
+    # animations use key framed prompts
+    args.prompts = animation_prompts
+
+    # create output folder for the batch
+    os.makedirs(args.outdir, exist_ok=True)
+    print(f"Saving animation frames to {args.outdir}")
+
+    # save settings for the batch
+    settings_filename = os.path.join(args.outdir, f"{args.timestring}_settings.txt")
+    with open(settings_filename, "w+", encoding="utf-8") as f:
+        s = {**dict(args.__dict__), **dict(anim_args.__dict__)}
+        json.dump(s, f, ensure_ascii=False, indent=4)
+
+    # expand prompts out to per-frame
+    prompt_series = pd.Series([np.nan for a in range(anim_args.max_frames)])
+    for i, prompt in animation_prompts.items():
+        prompt_series[i] = prompt
+    prompt_series = prompt_series.ffill().bfill()
+
+    # check for video inits
+    using_vid_init = anim_args.animation_mode == 'Video Input'
+
+    args.n_samples = 1
+    prev_sample = None
+    color_match_sample = None
+    for frame_idx in range(anim_args.max_frames):
+        print(f"Rendering animation frame {frame_idx} of {anim_args.max_frames}")
+
+        # apply transforms to previous frame
+        if prev_sample is not None:
+            if anim_args.key_frames:
+                angle = angle_series[frame_idx]
+                zoom = zoom_series[frame_idx]
+                translation_x = translation_x_series[frame_idx]
+                translation_y = translation_y_series[frame_idx]
+                print(
+                    f'angle: {angle}',
+                    f'zoom: {zoom}',
+                    f'translation_x: {translation_x}',
+                    f'translation_y: {translation_y}',
+                )
+            xform = make_xform_2d(args.W, args.H, translation_x, translation_y, angle, zoom)
+
+            # transform previous frame
+            prev_img = sample_to_cv2(prev_sample)
+            prev_img = cv2.warpPerspective(
+                prev_img,
+                xform,
+                (prev_img.shape[1], prev_img.shape[0]),
+                borderMode=cv2.BORDER_WRAP if anim_args.border == 'wrap' else cv2.BORDER_REPLICATE
+            )
+
+            # apply color matching
+            if anim_args.color_coherence == 'MatchFrame0':
+                if color_match_sample is None:
+                    color_match_sample = prev_img.copy()
+                else:
+                    prev_img = maintain_colors(prev_img, color_match_sample, (frame_idx%2) == 0)
+
+            # apply frame noising
+            noised_sample = add_noise(sample_from_cv2(prev_img), anim_args.previous_frame_noise)
+
+            # use transformed previous frame as init for current
+            args.use_init = True
+            args.init_sample = noised_sample.half().to(device)
+            args.strength = max(0.0, min(1.0, anim_args.previous_frame_strength))
+
+        # grab prompt for current frame
+        args.prompt = prompt_series[frame_idx]
+        print(f"{args.prompt} {args.seed}")
+
+        # grab init image for current frame
+        if using_vid_init:
+            init_frame = os.path.join(args.outdir, 'inputframes', f"{frame_idx+1:04}.jpg")            
+            print(f"Using video init frame {init_frame}")
+            args.init_image = init_frame
+
+        # sample the diffusion model
+        results = generate(args, return_latent=False, return_sample=True)
+        sample, image = results[0], results[1]
+    
+        filename = f"{args.timestring}_{frame_idx:05}.png"
+        image.save(os.path.join(args.outdir, filename))
+        if not using_vid_init:
+            prev_sample = sample
+        
+        display.clear_output(wait=True)
+        display.display(image)
+
+        args.seed = next_seed(args)
+
+def render_input_video(args, anim_args):
+    # create a folder for the video input frames to live in
+    video_in_frame_path = os.path.join(args.outdir, 'inputframes') 
+    os.makedirs(os.path.join(args.outdir, video_in_frame_path), exist_ok=True)
+    
+    # save the video frames from input video
+    print(f"Exporting Video Frames (1 every {anim_args.extract_nth_frame}) frames to {video_in_frame_path}...")
+    try:
+        for f in pathlib.Path(video_in_frame_path).glob('*.jpg'):
+            f.unlink()
+    except:
+        pass
+    vf = f'select=not(mod(n\,{anim_args.extract_nth_frame}))'
+    subprocess.run([
+        'ffmpeg', '-i', f'{anim_args.video_init_path}', 
+        '-vf', f'{vf}', '-vsync', 'vfr', '-q:v', '2', 
+        '-loglevel', 'error', '-stats',  
+        os.path.join(video_in_frame_path, '%04d.jpg')
+    ], stdout=subprocess.PIPE).stdout.decode('utf-8')
+
+    # determine max frames from length of input frames
+    anim_args.max_frames = len([f for f in pathlib.Path(video_in_frame_path).glob('*.jpg')])
+
+    args.use_init = True
+    print(f"Loading {anim_args.max_frames} input frames from {video_in_frame_path} and saving video frames to {args.outdir}")
+    render_animation(args, anim_args)
+
+def render_interpolation(args, anim_args):
+    # animations use key framed prompts
+    args.prompts = animation_prompts
+
+    # create output folder for the batch
+    os.makedirs(args.outdir, exist_ok=True)
+    print(f"Saving animation frames to {args.outdir}")
+
+    # save settings for the batch
+    settings_filename = os.path.join(args.outdir, f"{args.timestring}_settings.txt")
+    with open(settings_filename, "w+", encoding="utf-8") as f:
+        s = {**dict(args.__dict__), **dict(anim_args.__dict__)}
+        json.dump(s, f, ensure_ascii=False, indent=4)
+    
+    # Interpolation Settings
+    args.n_samples = 1
+    args.seed_behavior = 'fixed' # force fix seed at the moment bc only 1 seed is available
+    prompts_c_s = [] # cache all the text embeddings
+
+    print(f"Preparing for interpolation of the following...")
+
+    for i, prompt in animation_prompts.items():
+      args.prompt = prompt
+
+      # sample the diffusion model
+      results = generate(args, return_c=True)
+      c, image = results[0], results[1]
+      prompts_c_s.append(c) 
+      
+      # display.clear_output(wait=True)
+      display.display(image)
+      
+      args.seed = next_seed(args)
+
+    display.clear_output(wait=True)
+    print(f"Interpolation start...")
+
+    frame_idx = 0
+
+    for i in range(len(prompts_c_s)-1):
+      for j in range(anim_args.interpolate_x_frames+1):
+        # interpolate the text embedding
+        prompt1_c = prompts_c_s[i]
+        prompt2_c = prompts_c_s[i+1]  
+        args.init_c = prompt1_c.add(prompt2_c.sub(prompt1_c).mul(j * 1/(anim_args.interpolate_x_frames+1)))
+
+        # sample the diffusion model
+        results = generate(args)
+        image = results[0]
+
+        filename = f"{args.timestring}_{frame_idx:05}.png"
+        image.save(os.path.join(args.outdir, filename))
+        frame_idx += 1
+
+        display.clear_output(wait=True)
+        display.display(image)
+
+        args.seed = next_seed(args)
+
+    # generate the last prompt
+    args.init_c = prompts_c_s[-1]
+    results = generate(args)
+    image = results[0]
+    filename = f"{args.timestring}_{frame_idx:05}.png"
+    image.save(os.path.join(args.outdir, filename))
+
+    display.clear_output(wait=True)
+    display.display(image)
+    args.seed = next_seed(args)
+
+    #clear init_c
+    args.init_c = None
+
+if anim_args.animation_mode == '2D':
+    render_animation(args, anim_args)
+elif anim_args.animation_mode == 'Video Input':
+    render_input_video(args, anim_args)
+elif anim_args.animation_mode == 'Interpolation':
+    render_interpolation(args, anim_args)
+else:
+    render_image_batch(args)    
+
+# %%
+# !! {"metadata":{
+# !!   "id": "4zV0J_YbMCTx"
+# !! }}
+"""
+# Create video from frames
+"""
+
+# %%
+# !! {"metadata":{
+# !!   "cellView": "form",
+# !!   "id": "no2jP8HTMBM0"
+# !! }}
+skip_video_for_run_all = True #@param {type: 'boolean'}
+fps = 12#@param {type:"number"}
+
+if skip_video_for_run_all == True:
+    print('Skipping video creation, uncheck skip_video_for_run_all if you want to run it')
+else:
+    import subprocess
+    from base64 import b64encode
+
+    image_path = os.path.join(args.outdir, f"{args.timestring}_%05d.png")
+    mp4_path = os.path.join(args.outdir, f"{args.timestring}.mp4")
+
+    print(f"{image_path} -> {mp4_path}")
+
+    # make video
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-vcodec', 'png',
+        '-r', str(fps),
+        '-start_number', str(0),
+        '-i', image_path,
+        '-frames:v', str(anim_args.max_frames),
+        '-c:v', 'libx264',
+        '-vf',
+        f'fps={fps}',
+        '-pix_fmt', 'yuv420p',
+        '-crf', '17',
+        '-preset', 'veryfast',
+        mp4_path
+    ]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        print(stderr)
+        raise RuntimeError(stderr)
+
+    mp4 = open(mp4_path,'rb').read()
+    data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
+    display.display( display.HTML(f'<video controls loop><source src="{data_url}" type="video/mp4"></video>') )
 
 # %%
 # !! {"main_metadata":{
 # !!   "accelerator": "GPU",
 # !!   "colab": {
 # !!     "collapsed_sections": [],
-# !!     "name": "Deforum_Stable_Diffusion.ipynb",
-# !!     "provenance": [],
-# !!     "private_outputs": true
+# !!     "name": "Deforum_Stable_Diffusion + Interpolation.ipynb",
+# !!     "provenance": []
 # !!   },
 # !!   "gpuClass": "standard",
 # !!   "kernelspec": {
