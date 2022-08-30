@@ -36,7 +36,7 @@ mount_google_drive = True #@param {type:"boolean"}
 force_remount = False
 
 if mount_google_drive:
-    from google.colab import drive
+    from google.colab import drive # type: ignore
     try:
         drive_path = "/content/drive"
         drive.mount(drive_path,force_remount=force_remount)
@@ -121,7 +121,7 @@ sys.path.append('./src/clip')
 sys.path.append('./stable-diffusion/')
 sys.path.append('./k-diffusion')
 
-from helpers import save_samples
+from helpers import save_samples, sampler_fn
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
@@ -266,27 +266,15 @@ def generate(args, return_latent=False, return_sample=False, return_c=False):
                           c = args.init_c
 
                         if args.sampler in ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral"]:
-                            shape = [args.C, args.H // args.f, args.W // args.f]
-                            sigmas = model_wrap.get_sigmas(args.steps)
-                            if args.use_init:
-                                sigmas = sigmas[len(sigmas)-t_enc-1:]
-                                x = init_latent + torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
-                            else:
-                                x = torch.randn([args.n_samples, *shape], device=device) * sigmas[0]
-                            model_wrap_cfg = CFGDenoiser(model_wrap)
-                            extra_args = {'cond': c, 'uncond': uc, 'cond_scale': args.scale}
-                            if args.sampler=="klms":
-                                samples = sampling.sample_lms(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
-                            elif args.sampler=="dpm2":
-                                samples = sampling.sample_dpm_2(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
-                            elif args.sampler=="dpm2_ancestral":
-                                samples = sampling.sample_dpm_2_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
-                            elif args.sampler=="heun":
-                                samples = sampling.sample_heun(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
-                            elif args.sampler=="euler":
-                                samples = sampling.sample_euler(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
-                            elif args.sampler=="euler_ancestral":
-                                samples = sampling.sample_euler_ancestral(model_wrap_cfg, x, sigmas, extra_args=extra_args, disable=False, callback=callback)
+                            samples = sampler_fn(
+                                c=c, 
+                                uc=uc, 
+                                args=args, 
+                                model_wrap=model_wrap, 
+                                init_latent=init_latent, 
+                                t_enc=t_enc, 
+                                device=device, 
+                                cb=callback)
                         else:
 
                             if init_latent != None:
@@ -444,7 +432,7 @@ def load_model_from_config(config, ckpt, verbose=False, device='cuda', half_prec
     return model
 
 load_on_run_all = True #@param {type: 'boolean'}
-half_precision = True #@param {type: 'boolean'}
+half_precision = True # needs to be fixed
 
 if load_on_run_all:
 
@@ -608,7 +596,7 @@ def DeforumArgs():
     display_samples = True #@param {type:"boolean"}
 
     #@markdown **Image Settings**
-    n_samples = 1 #@param
+    n_samples = 1 # hidden
     W = 512 #@param
     H = 512 #@param
     W, H = map(lambda x: x - x % 64, (W, H))  # resize to integer multiple of 64
@@ -621,15 +609,19 @@ def DeforumArgs():
     #@markdown **Sampling Settings**
     seed = -1 #@param
     sampler = 'klms' #@param ["klms","dpm2","dpm2_ancestral","heun","euler","euler_ancestral","plms", "ddim"]
-    steps = 10 #@param
+    steps = 50 #@param
     scale = 7 #@param
     ddim_eta = 0.0 #@param
     dynamic_threshold = None
     static_threshold = None   
 
     #@markdown **Batch Settings**
-    n_batch = 1 #@param
+    n_batch = 4 #@param
     seed_behavior = "iter" #@param ["iter","fixed","random"]
+
+    #@markdown **Grid Settings**
+    make_grid = True #@param {type:"boolean"}
+    grid_rows = 2 #@param 
 
     precision = 'autocast' 
     fixed_code = True
@@ -658,6 +650,7 @@ args = SimpleNamespace(**DeforumArgs())
 args.timestring = time.strftime('%Y%m%d%H%M%S')
 args.strength = max(0.0, min(1.0, args.strength))
 
+
 if args.seed == -1:
     args.seed = random.randint(0, 2**32)
 if anim_args.animation_mode == 'Video Input':
@@ -670,6 +663,7 @@ if args.sampler == 'plms' and (args.use_init or anim_args.animation_mode != 'Non
     args.sampler = 'klms'
 if args.sampler != 'ddim':
     args.ddim_eta = 0
+
 
 def render_image_batch(args):
     args.prompts = prompts
@@ -692,7 +686,9 @@ def render_image_batch(args):
     if args.use_init:
         if args.init_image == "":
             raise FileNotFoundError("No path was given for init_image")
-        if not os.path.isfile(args.init_image):
+        if args.init_image.startswith('http://') or args.init_image.startswith('https://'):
+            init_array.append(args.init_image)
+        elif not os.path.isfile(args.init_image):
             if args.init_image[-1] != "/": # avoids path error by adding / to end if not there
                 args.init_image += "/" 
             for image in sorted(os.listdir(args.init_image)): # iterates dir and appends images to init_array
@@ -701,17 +697,22 @@ def render_image_batch(args):
         else:
             init_array.append(args.init_image)
     else:
-        init_array = [""] 
+        init_array = [""]
 
-    for batch_index in range(args.n_batch):
-        print(f"Batch {batch_index+1} of {args.n_batch}")
-        
-        for image in init_array: # iterates the init images
-            args.init_image = image
-            for prompt in prompts:
-                args.prompt = prompt
+    for iprompt, prompt in enumerate(prompts):  
+        args.prompt = prompt
+
+        all_images = []
+
+        for batch_index in range(args.n_batch):
+            print(f"Batch {batch_index+1} of {args.n_batch}")
+            
+            for image in init_array: # iterates the init images
+                args.init_image = image
                 results = generate(args)
                 for image in results:
+                    if args.make_grid:
+                        all_images.append(T.functional.pil_to_tensor(image))
                     if args.save_samples:
                         filename = f"{args.timestring}_{index:05}_{args.seed}.png"
                         image.save(os.path.join(args.outdir, filename))
@@ -719,6 +720,13 @@ def render_image_batch(args):
                         display.display(image)
                     index += 1
                 args.seed = next_seed(args)
+
+        #print(len(all_images))
+        if args.make_grid:
+            grid = make_grid(all_images, nrow=int(len(all_images)/args.grid_rows))
+            grid = rearrange(grid, 'c h w -> h w c').cpu().numpy()
+            filename = f"{args.timestring}_{iprompt:05d}_grid_{args.seed}.png"
+            Image.fromarray(grid.astype(np.uint8)).save(os.path.join(args.outdir, filename))
 
 
 def render_animation(args, anim_args):
@@ -825,7 +833,7 @@ def render_input_video(args, anim_args):
             f.unlink()
     except:
         pass
-    vf = f'select=not(mod(n\,{anim_args.extract_nth_frame}))'
+    vf = r'select=not(mod(n\,'+str(anim_args.extract_nth_frame)+'))'
     subprocess.run([
         'ffmpeg', '-i', f'{anim_args.video_init_path}', 
         '-vf', f'{vf}', '-vsync', 'vfr', '-q:v', '2', 
@@ -981,8 +989,9 @@ else:
 # !!   "accelerator": "GPU",
 # !!   "colab": {
 # !!     "collapsed_sections": [],
-# !!     "name": "Deforum_Stable_Diffusion + Interpolation.ipynb",
-# !!     "provenance": []
+# !!     "name": "Deforum_Stable_Diffusion_+_Interpolation.ipynb",
+# !!     "provenance": [],
+# !!     "private_outputs": true
 # !!   },
 # !!   "gpuClass": "standard",
 # !!   "kernelspec": {
